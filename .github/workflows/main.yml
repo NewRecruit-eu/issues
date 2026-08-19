@@ -12,7 +12,7 @@ jobs:
     if: github.event.issue.pull_request == null
     runs-on: ubuntu-latest
     env:
-      # Make the repository secret available inside the script
+      # PAT with Issues: read/write on the TARGET repo (classic: repo scope)
       TARGET_PAT: ${{ secrets.TARGET_PAT }}
       # Optional default target repo in owner/repo format. Example: BSData/horus-heresy-2nd-edition
       DEFAULT_TARGET_REPO: ""
@@ -26,17 +26,18 @@ jobs:
               core.info('No /move-to-data command found — exiting.');
               return;
             }
-
             const assoc = context.payload.comment.author_association;
             const allowed = ['OWNER', 'MEMBER', 'COLLABORATOR'];
             if (!allowed.includes(assoc)) {
               core.setFailed(`Commenter association ${assoc} is not allowed to run this command.`);
               return;
             }
-
+            if (!process.env.TARGET_PAT) {
+              core.setFailed('Missing TARGET_PAT secret. Add it to repository secrets.');
+              return;
+            }
             const parts = cmd.split(/\s+/);
-            const targetArg = parts[1];
-            const targetRepo = targetArg || process.env.DEFAULT_TARGET_REPO;
+            const targetRepo = parts[1] || process.env.DEFAULT_TARGET_REPO;
             if (!targetRepo) {
               core.setFailed('No target repo provided and DEFAULT_TARGET_REPO is not set. Use: /move-to-data owner/repo');
               return;
@@ -47,61 +48,46 @@ jobs:
               return;
             }
 
-            const issueNumber = context.payload.issue.number;
+            // Separate client: octokit's auth hook overwrites any authorization header passed to github.request()
+            const target = require('@actions/github').getOctokit(process.env.TARGET_PAT);
 
+            const issueNumber = context.payload.issue.number;
             const { data: issue } = await github.rest.issues.get({
               owner: context.repo.owner,
               repo: context.repo.repo,
               issue_number: issueNumber,
             });
-
             const commentsResp = await github.rest.issues.listComments({
               owner: context.repo.owner,
               repo: context.repo.repo,
               issue_number: issueNumber,
+              per_page: 100,
             });
 
-            const originalUrl = issue.html_url;
-            let newBody = `Imported from ${originalUrl}\n\n---\n\n${issue.body || ''}`;
-
+            const newBody = `Imported from ${issue.html_url}\n\n---\n\n${issue.body || ''}`;
             const labels = (issue.labels || []).map(l => (typeof l === 'string' ? l : l.name)).filter(Boolean);
 
-            if (!process.env.TARGET_PAT) {
-              core.setFailed('Missing TARGET_PAT secret in environment. Please add TARGET_PAT to repository secrets and ensure it is referenced in the workflow as ${{ secrets.TARGET_PAT }}.');
-              return;
+            let createdIssue;
+            try {
+              ({ data: createdIssue } = await target.rest.issues.create({
+                owner: targetOwner, repo: targetName, title: issue.title, body: newBody, labels,
+              }));
+            } catch (e) {
+              // Target repo may not have these label names and the PAT may not be allowed to create them
+              core.warning(`Create with labels failed (${e.status}), retrying without labels.`);
+              ({ data: createdIssue } = await target.rest.issues.create({
+                owner: targetOwner, repo: targetName, title: issue.title, body: newBody,
+              }));
             }
-
-            const createResp = await github.request(
-              'POST /repos/{owner}/{repo}/issues',
-              {
-                owner: targetOwner,
-                repo: targetName,
-                title: issue.title,
-                body: newBody,
-                labels,
-                headers: {
-                  authorization: `token ${process.env.TARGET_PAT}`,
-                },
-              }
-            );
-
-            const createdIssue = createResp.data;
             core.info(`Created issue ${createdIssue.html_url} in ${targetRepo}`);
 
             for (const c of commentsResp.data) {
-              const cBody = `From @${c.user.login} on original issue:\n\n${c.body || ''}`;
-              await github.request(
-                'POST /repos/{owner}/{repo}/issues/{issue_number}/comments',
-                {
-                  owner: targetOwner,
-                  repo: targetName,
-                  issue_number: createdIssue.number,
-                  body: cBody,
-                  headers: {
-                    authorization: `token ${process.env.TARGET_PAT}`,
-                  },
-                }
-              );
+              await target.rest.issues.createComment({
+                owner: targetOwner,
+                repo: targetName,
+                issue_number: createdIssue.number,
+                body: `From @${c.user.login} on original issue:\n\n${c.body || ''}`,
+              });
             }
 
             await github.rest.issues.createComment({
@@ -110,7 +96,6 @@ jobs:
               issue_number: issueNumber,
               body: `This issue was moved to ${createdIssue.html_url} by @${context.actor}`,
             });
-
             await github.rest.issues.update({
               owner: context.repo.owner,
               repo: context.repo.repo,
