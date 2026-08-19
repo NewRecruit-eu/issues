@@ -12,7 +12,10 @@ jobs:
     if: github.event.issue.pull_request == null
     runs-on: ubuntu-latest
     env:
-      DEFAULT_TARGET_REPO: ""  # set to owner/repo (e.g., NewRecruit-eu/data) to allow "/move-to-data" without args
+      # Make the repository secret available inside the script
+      TARGET_PAT: ${{ secrets.TARGET_PAT }}
+      # Optional default target repo in owner/repo format. Example: BSData/horus-heresy-2nd-edition
+      DEFAULT_TARGET_REPO: ""
     steps:
       - name: Move issue when comment is /move-to-data
         uses: actions/github-script@v6
@@ -64,7 +67,7 @@ jobs:
             const labels = (issue.labels || []).map(l => (typeof l === 'string' ? l : l.name)).filter(Boolean);
 
             if (!process.env.TARGET_PAT) {
-              core.setFailed('Missing TARGET_PAT secret. Please add it in repository Settings → Secrets → Actions.');
+              core.setFailed('Missing TARGET_PAT secret in environment. Please add TARGET_PAT to repository secrets and ensure it is referenced in the workflow as ${{ secrets.TARGET_PAT }}.');
               return;
             }
 
