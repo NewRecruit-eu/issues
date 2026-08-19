@@ -1,0 +1,116 @@
+name: Issue mover
+
+on:
+  issue_comment:
+    types: [created]
+
+permissions:
+  issues: write
+
+jobs:
+  move_issue:
+    if: github.event.issue.pull_request == null
+    runs-on: ubuntu-latest
+    env:
+      DEFAULT_TARGET_REPO: ""  # set to owner/repo (e.g., NewRecruit-eu/data) to allow "/move-to-data" without args
+    steps:
+      - name: Move issue when comment is /move-to-data
+        uses: actions/github-script@v6
+        with:
+          script: |
+            const cmd = context.payload.comment.body.trim();
+            if (!cmd.startsWith('/move-to-data')) {
+              core.info('No /move-to-data command found — exiting.');
+              return;
+            }
+
+            const assoc = context.payload.comment.author_association;
+            const allowed = ['OWNER', 'MEMBER', 'COLLABORATOR'];
+            if (!allowed.includes(assoc)) {
+              core.setFailed(`Commenter association ${assoc} is not allowed to run this command.`);
+              return;
+            }
+
+            const parts = cmd.split(/\s+/);
+            const targetArg = parts[1];
+            const targetRepo = targetArg || process.env.DEFAULT_TARGET_REPO;
+            if (!targetRepo) {
+              core.setFailed('No target repo provided and DEFAULT_TARGET_REPO is not set. Use: /move-to-data owner/repo');
+              return;
+            }
+            const [targetOwner, targetName] = targetRepo.split('/');
+            if (!targetOwner || !targetName) {
+              core.setFailed('Target repo must be in owner/repo format.');
+              return;
+            }
+
+            const issueNumber = context.payload.issue.number;
+
+            const { data: issue } = await github.rest.issues.get({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: issueNumber,
+            });
+
+            const commentsResp = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: issueNumber,
+            });
+
+            const originalUrl = issue.html_url;
+            let newBody = `Imported from ${originalUrl}\n\n---\n\n${issue.body || ''}`;
+
+            const labels = (issue.labels || []).map(l => (typeof l === 'string' ? l : l.name)).filter(Boolean);
+
+            if (!process.env.TARGET_PAT) {
+              core.setFailed('Missing TARGET_PAT secret. Please add it in repository Settings → Secrets → Actions.');
+              return;
+            }
+
+            const createResp = await github.request(
+              'POST /repos/{owner}/{repo}/issues',
+              {
+                owner: targetOwner,
+                repo: targetName,
+                title: issue.title,
+                body: newBody,
+                labels,
+                headers: {
+                  authorization: `token ${process.env.TARGET_PAT}`,
+                },
+              }
+            );
+
+            const createdIssue = createResp.data;
+            core.info(`Created issue ${createdIssue.html_url} in ${targetRepo}`);
+
+            for (const c of commentsResp.data) {
+              const cBody = `From @${c.user.login} on original issue:\n\n${c.body || ''}`;
+              await github.request(
+                'POST /repos/{owner}/{repo}/issues/{issue_number}/comments',
+                {
+                  owner: targetOwner,
+                  repo: targetName,
+                  issue_number: createdIssue.number,
+                  body: cBody,
+                  headers: {
+                    authorization: `token ${process.env.TARGET_PAT}`,
+                  },
+                }
+              );
+            }
+
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: issueNumber,
+              body: `This issue was moved to ${createdIssue.html_url} by @${context.actor}`,
+            });
+
+            await github.rest.issues.update({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: issueNumber,
+              state: 'closed',
+            });
