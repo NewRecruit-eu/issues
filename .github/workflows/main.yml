@@ -18,7 +18,7 @@ jobs:
       DEFAULT_TARGET_REPO: ""
     steps:
       - name: Move issue when comment is /move-to-data
-        uses: actions/github-script@v6
+        uses: actions/github-script@v7
         with:
           script: |
             const cmd = context.payload.comment.body.trim();
@@ -48,8 +48,21 @@ jobs:
               return;
             }
 
-            // Separate client: octokit's auth hook overwrites any authorization header passed to github.request()
-            const target = require('@actions/github').getOctokit(process.env.TARGET_PAT);
+            // Raw fetch, not github.request(): octokit's auth hook overwrites any authorization header we pass
+            const post = async (path, payload) => {
+              const res = await fetch(`https://api.github.com/${path}`, {
+                method: 'POST',
+                headers: {
+                  authorization: `Bearer ${process.env.TARGET_PAT}`,
+                  accept: 'application/vnd.github+json',
+                  'content-type': 'application/json',
+                  'user-agent': 'issue-mover',
+                },
+                body: JSON.stringify(payload),
+              });
+              if (!res.ok) throw new Error(`${res.status} on ${path}: ${await res.text()}`);
+              return res.json();
+            };
 
             const issueNumber = context.payload.issue.number;
             const { data: issue } = await github.rest.issues.get({
@@ -66,26 +79,20 @@ jobs:
 
             const newBody = `Imported from ${issue.html_url}\n\n---\n\n${issue.body || ''}`;
             const labels = (issue.labels || []).map(l => (typeof l === 'string' ? l : l.name)).filter(Boolean);
+            const issuesPath = `repos/${targetOwner}/${targetName}/issues`;
 
             let createdIssue;
             try {
-              ({ data: createdIssue } = await target.rest.issues.create({
-                owner: targetOwner, repo: targetName, title: issue.title, body: newBody, labels,
-              }));
+              createdIssue = await post(issuesPath, { title: issue.title, body: newBody, labels });
             } catch (e) {
               // Target repo may not have these label names and the PAT may not be allowed to create them
-              core.warning(`Create with labels failed (${e.status}), retrying without labels.`);
-              ({ data: createdIssue } = await target.rest.issues.create({
-                owner: targetOwner, repo: targetName, title: issue.title, body: newBody,
-              }));
+              core.warning(`Create with labels failed: ${e.message}. Retrying without labels.`);
+              createdIssue = await post(issuesPath, { title: issue.title, body: newBody });
             }
             core.info(`Created issue ${createdIssue.html_url} in ${targetRepo}`);
 
             for (const c of commentsResp.data) {
-              await target.rest.issues.createComment({
-                owner: targetOwner,
-                repo: targetName,
-                issue_number: createdIssue.number,
+              await post(`${issuesPath}/${createdIssue.number}/comments`, {
                 body: `From @${c.user.login} on original issue:\n\n${c.body || ''}`,
               });
             }
